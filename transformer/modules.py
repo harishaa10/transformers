@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 
 class MultiHeadAttentionWithMaskBlock(nn.Module):
-    def __init__(self, dim= 1024, num_heads= 4):
+    def __init__(self, dim: int, num_heads: int, dropout= 0):
         super(MultiHeadAttentionWithMaskBlock, self).__init__()
 
         assert dim%num_heads==0, "dim should be divisible by num_heads"
@@ -16,10 +16,11 @@ class MultiHeadAttentionWithMaskBlock(nn.Module):
         self.heads = num_heads
         self.per_head = dim // num_heads
 
-        self.query_layer = nn.Linear(dim, dim)
-        self.keys_layer = nn.Linear(dim, dim)
-        self.values_layer = nn.Linear(dim, dim)
-        self.linear_layer = nn.Linear(dim, dim)
+        self.query_layer = nn.Linear(dim, dim, bias= False)
+        self.keys_layer = nn.Linear(dim, dim, bias= False)
+        self.values_layer = nn.Linear(dim, dim, bias= False)
+        self.linear_layer = nn.Linear(dim, dim, bias= False)
+        self.dropout = nn.Dropout(dropout)
 
     def split_head(self, tensor: Tensor):
         batch_size, num_tokens, dim = tensor.size()
@@ -34,7 +35,8 @@ class MultiHeadAttentionWithMaskBlock(nn.Module):
         weights = torch.matmul(query, keys.transpose(-2, -1)) / math.sqrt(self.per_head)
         if mask is not None:
             weights = weights.masked_fill(mask == 0, -1e9)
-        weights = F.softmax(weights, dim= -2)
+        weights = F.softmax(weights, dim= -1)
+        weights = self.dropout(weights)
 
         weighted_values = torch.matmul(weights, values)
         weighted_values = weighted_values.transpose(1,2).contiguous().reshape(query.shape[0], -1, self.dim)
@@ -44,15 +46,26 @@ class MultiHeadAttentionWithMaskBlock(nn.Module):
 
 
 class FeedForwardNetworkBlock(nn.Module):
-    def __init__(self, dim= 1024, inter_dim= 512):
+    def __init__(self, dim: int, inter_dim: int):
         super(FeedForwardNetworkBlock, self).__init__()
 
-        self.ff1 = nn.Linear(dim, inter_dim)
-        self.ff2 = nn.Linear(inter_dim, dim)
+        self.ff1 = nn.Linear(dim, inter_dim, bias=True)
+        self.ff2 = nn.Linear(inter_dim, dim, bias=True)
         self.relu = nn.ReLU()
     
     def forward(self, attention):
         return self.ff2(self.relu(self.ff1(attention)))
+
+
+class TransformerEmbeddings(nn.Module):
+    def __init__(self, vocab_size, dim):
+        super(TransformerEmbeddings, self).__init__()
+
+        self.embedding = nn.Embedding(vocab_size, dim)
+        self.dim = dim
+
+    def forward(self, tokens):
+        return self.embedding(tokens) * math.sqrt(self.dim)
 
 
 class PositionalEncodingBlock(nn.Module):
@@ -61,22 +74,22 @@ class PositionalEncodingBlock(nn.Module):
 
         pe= torch.zeros(max_token_length, dim)
         position = torch.arange(0, max_token_length, dtype=torch.float).unsqueeze(1)
-        # div_alt = torch.exp(torch.arange(0, dim, 2).float() * -(math.log(10000.0) / dim))
-        div = 1 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        div_alt = torch.exp(torch.arange(0, dim, 2).float() * -(math.log(10000.0) / dim))
+        # div = 1 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
 
-        pe[:, 0::2] = torch.sin(position * div)
-        pe[:, 1::2] = torch.cos(position * div)
+        pe[:, 0::2] = torch.sin(position * div_alt)
+        pe[:, 1::2] = torch.cos(position * div_alt)
         self.register_buffer("pe", pe.unsqueeze(0))
 
     def forward(self, tokens):
-        return tokens + self.pe[:, :tokens.size(1), :]
+        return tokens + self.pe[:, :tokens.size(1), :].requires_grad_(False)
     
 
 class EncoderBlock(nn.Module):
     def __init__(self, num_heads: int, dim: int, inter_dim: int, dropout: float = 0):
         super(EncoderBlock, self).__init__()
 
-        self.mha = MultiHeadAttentionWithMaskBlock(dim, num_heads)
+        self.mha = MultiHeadAttentionWithMaskBlock(dim, num_heads, dropout)
         self.ff = FeedForwardNetworkBlock(dim, inter_dim)
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
@@ -84,11 +97,9 @@ class EncoderBlock(nn.Module):
 
     def forward(self, token_embeddings, input_mask):
         mha_res = self.mha(token_embeddings, token_embeddings, token_embeddings, input_mask)
-        mha_res = self.dropout(mha_res)
-        add_norm1= self.norm1(torch.add(token_embeddings, mha_res))
+        add_norm1 = self.norm1(token_embeddings + self.dropout(mha_res))
         ff_res = self.ff(add_norm1)
-        ff_res = self.dropout(ff_res)
-        add_norm2 = self.norm2(torch.add(add_norm1, ff_res))
+        add_norm2 = self.norm2(add_norm1 + self.dropout(ff_res))
         return add_norm2
 
 
@@ -96,8 +107,8 @@ class DecoderBlock(nn.Module):
     def __init__(self, num_heads: int, dim: int, inter_dim: int, dropout: float = 0):
         super(DecoderBlock, self).__init__()
 
-        self.self_attention = MultiHeadAttentionWithMaskBlock(dim, num_heads)
-        self.cross_attention = MultiHeadAttentionWithMaskBlock(dim, num_heads)
+        self.self_attention = MultiHeadAttentionWithMaskBlock(dim, num_heads, dropout)
+        self.cross_attention = MultiHeadAttentionWithMaskBlock(dim, num_heads, dropout)
         self.ff = FeedForwardNetworkBlock(dim, inter_dim)
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
@@ -105,30 +116,26 @@ class DecoderBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, output_embeddings, encoder_output, source_mask, target_mask):
-        mmha_res = self.self_attention(output_embeddings, output_embeddings, output_embeddings, target_mask)
-        mmha_res = self.dropout(mmha_res)
-        add_norm1= self.norm1(torch.add(output_embeddings, mmha_res))
-        mha_res = self.cross_attention(add_norm1, encoder_output, encoder_output, source_mask)
-        mha_res = self.dropout(mha_res)
-        add_norm2 = self.norm2(torch.add(add_norm1, mha_res))
+        self_att_res = self.self_attention(output_embeddings, output_embeddings, output_embeddings, target_mask)
+        add_norm1 = self.norm1(output_embeddings + self.dropout(self_att_res))
+        cross_att_res = self.cross_attention(add_norm1, encoder_output, encoder_output, source_mask)
+        add_norm2 = self.norm2(add_norm1 + self.dropout(cross_att_res))
         ff_res = self.ff(add_norm2)
-        ff_res = self.dropout(ff_res)
-        add_norm3 = self.norm3(torch.add(add_norm2, ff_res))
+        add_norm3 = self.norm3(add_norm2 + self.dropout(ff_res))
         return add_norm3
 
 
 class TransformerModule(nn.Module):
-    def __init__(self, dim, encoder_vocab_size, decoder_vocab_size, max_token_length, num_heads, num_layers, dropout = 0):
+    def __init__(self, dim, vocab_size, max_token_length, num_heads, num_layers, dropout = 0):
         super(TransformerModule, self).__init__()
 
-        self.encoder_embedding = nn.Embedding(encoder_vocab_size, dim)
-        self.decoder_embedding = nn.Embedding(decoder_vocab_size, dim)
+        self.embedding = TransformerEmbeddings(vocab_size, dim)
         self.positional_encoder = PositionalEncodingBlock(max_token_length, dim)
 
         self.encoder_layers = nn.ModuleList([EncoderBlock(num_heads, dim, 4* dim, dropout) for _ in range(num_layers)])
         self.decoder_layers = nn.ModuleList([DecoderBlock(num_heads, dim, 4* dim, dropout) for _ in range(num_layers)])
         
-        self.linear = nn.Linear(dim, decoder_vocab_size)
+        self.linear = nn.Linear(dim, vocab_size)
         self.dropout = nn.Dropout(dropout)
 
     def generate_mask(self, input, target):
@@ -143,8 +150,8 @@ class TransformerModule(nn.Module):
     def forward(self, input, target):
         input_mask, target_mask = self.generate_mask(input, target)
 
-        input_embedding = self.dropout(self.positional_encoder(self.encoder_embedding(input)))
-        output_embedding = self.dropout(self.positional_encoder(self.decoder_embedding(target)))
+        input_embedding = self.dropout(self.positional_encoder(self.embedding(input)))
+        output_embedding = self.dropout(self.positional_encoder(self.embedding(target)))
 
         encoder_output = input_embedding
         for encoder_layer in self.encoder_layers:
